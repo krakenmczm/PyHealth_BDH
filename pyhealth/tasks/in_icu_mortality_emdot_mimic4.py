@@ -1,6 +1,6 @@
 """In-ICU mortality 24 hours after ICU admission, for EMDOT on MIMIC-IV.
 
-Contributors: <Your Name>, <Partner Name>
+Contributors: Karen Moctezuma Maya, Mary K La
 Paper: Evaluating Model Performance in Medical Datasets Over Time
 Paper link: https://proceedings.mlr.press/v219/zhou23a.html
 Description: in-ICU mortality prediction task with an estimated calendar
