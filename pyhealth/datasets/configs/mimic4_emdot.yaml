@@ -1,0 +1,266 @@
+# MIMIC-IV tables for InICUMortalityEMDOTMIMIC4 (pyhealth/tasks/in_icu_mortality_emdot_mimic4.py).
+#
+# hosp/ and icu/: the original MIMIC-IV tables, as downloaded from PhysioNet
+# (.csv.gz). Compared with mimic4_ehr.yaml:
+#   admissions      + edregtime, edouttime (emergency department visit flag)
+#   services        hospital service at ICU admission
+#   procedures_icd  timed by chartdate (the date the procedure was done)
+#   emar            medication administrations, joined to their prescription
+#                   (drug name, GSN and NDC codes) on pharmacy_id
+#
+# derived/: four tables of the MIT-LCP mimic-code concepts (mimiciv_derived),
+# one row per ICU stay, saved as Parquet. They are not part of the PhysioNet
+# download: build them with the mimic-code scripts
+# (https://github.com/MIT-LCP/mimic-code/tree/main/mimic-iv/concepts), or
+# export them from BigQuery (physionet-data.mimiciv_derived), e.g.
+#   SELECT * FROM `physionet-data.mimiciv_derived.first_day_vitalsign`
+#
+# Usage:
+#   from pyhealth.datasets import MIMIC4EHRDataset
+#   from pyhealth.tasks.in_icu_mortality_emdot_mimic4 import EMDOT_CONFIG, EMDOT_TABLES
+#   dataset = MIMIC4EHRDataset(root=".../mimiciv/3.1", tables=EMDOT_TABLES,
+#                              config_path=EMDOT_CONFIG)
+version: "3.1"
+tables:
+  patients:
+    file_path: "hosp/patients.csv.gz"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "gender"
+      - "anchor_age"
+      - "anchor_year"
+      - "anchor_year_group"
+      - "dod"
+  admissions:
+    file_path: "hosp/admissions.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "admittime"
+    attributes:
+      - "hadm_id"
+      - "admission_type"
+      - "admission_location"
+      - "insurance"
+      - "language"
+      - "marital_status"
+      - "race"
+      - "edregtime"
+      - "edouttime"
+      - "discharge_location"
+      - "dischtime"
+      - "deathtime"
+      - "hospital_expire_flag"
+  icustays:
+    file_path: "icu/icustays.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "intime"
+    attributes:
+      - "hadm_id"
+      - "stay_id"
+      - "first_careunit"
+      - "last_careunit"
+      - "outtime"
+  services:
+    file_path: "hosp/services.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "transfertime"
+    attributes:
+      - "hadm_id"
+      - "prev_service"
+      - "curr_service"
+  diagnoses_icd:
+    file_path: "hosp/diagnoses_icd.csv.gz"
+    patient_id: "subject_id"
+    join:
+      - file_path: "hosp/admissions.csv.gz"
+        "on": "hadm_id"
+        how: "inner"
+        columns:
+          - "dischtime"
+    timestamp: "dischtime"
+    attributes:
+      - "hadm_id"
+      - "icd_code"
+      - "icd_version"
+      - "seq_num"
+  procedures_icd:
+    file_path: "hosp/procedures_icd.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "chartdate"
+    attributes:
+      - "hadm_id"
+      - "icd_code"
+      - "icd_version"
+      - "seq_num"
+  emar:
+    file_path: "hosp/emar.csv.gz"
+    patient_id: "subject_id"
+    join:
+      - file_path: "hosp/prescriptions.csv.gz"
+        "on": "pharmacy_id"
+        how: "inner"
+        columns:
+          - "drug"
+          - "gsn"
+          - "ndc"
+    timestamp: "charttime"
+    attributes:
+      - "hadm_id"
+      - "emar_id"
+      - "pharmacy_id"
+      - "medication"
+      - "event_txt"
+      - "drug"
+      - "gsn"
+      - "ndc"
+
+  # derived: vital signs, 6 h before to 24 h after ICU admission
+  first_day_vitalsign:
+    file_path: "derived/first_day_vitalsign.parquet"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "stay_id"
+      - "heart_rate_min"
+      - "heart_rate_max"
+      - "heart_rate_mean"
+      - "sbp_min"
+      - "sbp_max"
+      - "sbp_mean"
+      - "dbp_min"
+      - "dbp_max"
+      - "dbp_mean"
+      - "mbp_min"
+      - "mbp_max"
+      - "mbp_mean"
+      - "resp_rate_min"
+      - "resp_rate_max"
+      - "resp_rate_mean"
+      - "temperature_min"
+      - "temperature_max"
+      - "temperature_mean"
+      - "spo2_min"
+      - "spo2_max"
+      - "spo2_mean"
+      - "glucose_min"
+      - "glucose_max"
+      - "glucose_mean"
+
+  # derived: lab tests, 6 h before to 24 h after ICU admission
+  first_day_lab:
+    file_path: "derived/first_day_lab.parquet"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "stay_id"
+      - "hematocrit_min"
+      - "hematocrit_max"
+      - "hemoglobin_min"
+      - "hemoglobin_max"
+      - "platelets_min"
+      - "platelets_max"
+      - "wbc_min"
+      - "wbc_max"
+      - "albumin_min"
+      - "albumin_max"
+      - "globulin_min"
+      - "globulin_max"
+      - "total_protein_min"
+      - "total_protein_max"
+      - "aniongap_min"
+      - "aniongap_max"
+      - "bicarbonate_min"
+      - "bicarbonate_max"
+      - "bun_min"
+      - "bun_max"
+      - "calcium_min"
+      - "calcium_max"
+      - "chloride_min"
+      - "chloride_max"
+      - "creatinine_min"
+      - "creatinine_max"
+      - "glucose_min"
+      - "glucose_max"
+      - "sodium_min"
+      - "sodium_max"
+      - "potassium_min"
+      - "potassium_max"
+      - "abs_basophils_min"
+      - "abs_basophils_max"
+      - "abs_eosinophils_min"
+      - "abs_eosinophils_max"
+      - "abs_lymphocytes_min"
+      - "abs_lymphocytes_max"
+      - "abs_monocytes_min"
+      - "abs_monocytes_max"
+      - "abs_neutrophils_min"
+      - "abs_neutrophils_max"
+      - "atyps_min"
+      - "atyps_max"
+      - "bands_min"
+      - "bands_max"
+      - "imm_granulocytes_min"
+      - "imm_granulocytes_max"
+      - "metas_min"
+      - "metas_max"
+      - "nrbc_min"
+      - "nrbc_max"
+      - "d_dimer_min"
+      - "d_dimer_max"
+      - "fibrinogen_min"
+      - "fibrinogen_max"
+      - "thrombin_min"
+      - "thrombin_max"
+      - "inr_min"
+      - "inr_max"
+      - "pt_min"
+      - "pt_max"
+      - "ptt_min"
+      - "ptt_max"
+      - "alt_min"
+      - "alt_max"
+      - "alp_min"
+      - "alp_max"
+      - "ast_min"
+      - "ast_max"
+      - "amylase_min"
+      - "amylase_max"
+      - "bilirubin_total_min"
+      - "bilirubin_total_max"
+      - "bilirubin_direct_min"
+      - "bilirubin_direct_max"
+      - "bilirubin_indirect_min"
+      - "bilirubin_indirect_max"
+      - "ck_cpk_min"
+      - "ck_cpk_max"
+      - "ck_mb_min"
+      - "ck_mb_max"
+      - "ggt_min"
+      - "ggt_max"
+      - "ld_ldh_min"
+      - "ld_ldh_max"
+
+  # derived: SOFA score of the first ICU day
+  first_day_sofa:
+    file_path: "derived/first_day_sofa.parquet"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "stay_id"
+      - "sofa"
+      - "respiration"
+      - "coagulation"
+      - "liver"
+      - "cardiovascular"
+      - "cns"
+      - "renal"
+
+  # derived: dialysis during the first ICU day
+  first_day_rrt:
+    file_path: "derived/first_day_rrt.parquet"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "stay_id"
+      - "dialysis_present"
+      - "dialysis_active"
