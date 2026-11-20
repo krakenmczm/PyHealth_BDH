@@ -204,6 +204,9 @@ from .yaib_eicu import (
     YAIBMortalityEICU as YAIBMortalityEICU,
     YAIBSepsisEICU as YAIBSepsisEICU,
 )
+from .in_icu_mortality_emdot_mimic4 import (
+    InICUMortalityEMDOTMIMIC4 as InICUMortalityEMDOTMIMIC4,
+)
 
 
 def __getattr__(name: str):

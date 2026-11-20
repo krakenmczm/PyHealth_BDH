@@ -1,64 +1,27 @@
 """In-ICU mortality 24 hours after ICU admission, for EMDOT on MIMIC-IV.
 
-Contributors: Karen Moctezuma Maya, Mary K La
+Contributors: 
 Paper: Evaluating Model Performance in Medical Datasets Over Time
+    (Zhou, Chen & Lipton, MLHC 2023)
 Paper link: https://proceedings.mlr.press/v219/zhou23a.html
-Description: in-ICU mortality prediction task with an estimated calendar
-year per sample, for evaluating models over time (EMDOT) on MIMIC-IV.
+Description: predicts death in the ICU from data known 24 h after ICU
+admission, with an estimated calendar year per sample (``est_year``), so
+models can be trained on past years and tested on later ones.
 
-Task for a replication of the MIMIC-IV experiment of Zhou, H., Chen, Y. and
-Lipton, Z. C., "Evaluating Model Performance in Medical Datasets Over Time",
-Machine Learning for Healthcare (MLHC) 2023 (code:
-https://github.com/acmi-lab/EvaluationOverTime).
+Data: MIMIC-IV ``hosp/`` and ``icu/`` tables plus four mimic-code tables in
+``derived/`` (``first_day_vitalsign``, ``first_day_lab``, ``first_day_sofa``,
+``first_day_rrt``); see ``pyhealth/datasets/configs/mimic4_emdot.yaml``.
 
-**Data.** The original MIMIC-IV tables (``hosp/``, ``icu/``) plus four
-tables of the MIT-LCP mimic-code concepts (``mimiciv_derived``):
-``first_day_vitalsign``, ``first_day_lab``, ``first_day_sofa`` and
-``first_day_rrt``, saved as Parquet in ``derived/``. See
-``pyhealth/datasets/configs/mimic4_emdot.yaml``.
+Cohort: first ICU stay per patient, with a hospital admission and a
+discharge time, estimated year up to 2022, ICU stay of 24 h or more, and a
+first-day vital sign or lab value. Labels: ``died_icu_outtime_dod`` (target),
+``died_in_icu``, ``died_in_icu_deathtime``. Features: demographics, service,
+admission details, first-day vitals, labs, SOFA and dialysis, procedure
+codes and prior diagnoses (medications with ``use_medications=True``).
 
-**Cohort** (one sample per patient, in this order; each step can be changed):
-
-1. First ICU stay per patient (earliest ``intime``).
-2. Admitted to the hospital (``hadm_id`` recorded).
-3. ICU discharge time recorded.
-4. Anchor year group starting in ``min_anchor_start`` or later (2014).
-5. Estimated year of the stay at most ``max_year`` (2022).
-6. ICU stay of at least ``min_icu_hours`` (24).
-7. Clinical data in the first 24 h: at least one first-day vital sign or lab.
-
-**Labels** (all three are kept on each sample; ``label`` picks the target):
-
-* ``died_icu_outtime_dod``: date of death equals the ICU discharge date.
-* ``died_in_icu``: date of death between the ICU admission and discharge dates.
-* ``died_in_icu_deathtime``: in-hospital time of death within the ICU stay.
-
-**Features** (known 24 h after ICU admission):
-
-* Demographics: age at ICU admission, sex, hospital service at ICU admission
-  (``services``), first care unit.
-* ``adm_``: admission type and location, insurance, language, marital status,
-  race, emergency department visit (``any_ed``). Discharge information is
-  never used.
-* ``vit_``, ``fdlab_``, ``sofa_``: every column of the first-day vital sign,
-  lab and SOFA tables. ``rrt_rrt``: 1 if dialysis was present or active.
-* ``px_``: procedure codes of the admission done by the end of the first
-  24 h (day level: ``chartdate``).
-* ``med_`` and ``rx_``: medications given in the first 24 h (``emar`` events
-  matched to their prescription), by eMAR medication name and by
-  prescription drug name.
-* ``medclass_``: drug classes of those medications, from a GSN/name lookup
-  table (optional, ``medication_class_map``).
-* ``dxprior_``: diagnosis codes of hospital stays that ended before this ICU
-  stay. Current-admission diagnoses (``dx_``) leak the outcome and are off
-  unless ``use_diagnoses=True`` (drift analysis only).
-
-For each code group: ``has_record``, ``n_distinct`` and one yes/no column per
-code among the ``top_n`` (50) most common in the cohort. Numeric features
-missing for more than ``max_missing_rate`` (10%) of the cohort are removed.
-
-Choosing the top codes and categories and removing mostly-missing features
-needs the whole cohort, so the task runs twice:
+The task runs twice: pass 1 returns one record per patient for
+:func:`cohort_summary` and :func:`select_features`; pass 2, with the
+resulting ``feature_spec``, returns the model inputs.
 
     >>> from pyhealth.datasets import MIMIC4EHRDataset
     >>> from pyhealth.tasks.in_icu_mortality_emdot_mimic4 import (
@@ -75,7 +38,6 @@ needs the whole cohort, so the task runs twice:
     ...     InICUMortalityEMDOTMIMIC4(feature_spec=spec))   # doctest: +SKIP
 """
 
-import ast
 import math
 import os
 import re
@@ -96,7 +58,6 @@ __all__ = [
     "InICUMortalityEMDOTMIMIC4",
     "cohort_summary",
     "estimate_year",
-    "load_medication_class_map",
     "safe_name",
     "select_features",
     "vectorize",
@@ -199,7 +160,6 @@ VALUE_SOURCES = {
 }
 BINARY_VALUES = ("adm_any_ed", "rrt_rrt")
 
-# eMAR events that count as "given" 
 EMAR_GIVEN = "(administered|applied|confirmed|started|rate change)"
 EMAR_NOT_GIVEN = r"\b(not|stopped)\b"
 _EMAR_GIVEN = re.compile(EMAR_GIVEN)
@@ -207,7 +167,7 @@ _EMAR_NOT_GIVEN = re.compile(EMAR_NOT_GIVEN)
 
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Helpers
 # ---------------------------------------------------------------------------
 def _to_datetime(value: Any) -> datetime | None:
     """Parses a MIMIC time or date (string, date or datetime); None if empty."""
@@ -257,7 +217,7 @@ def _attr(event: Any, name: str) -> Any:
 
 
 def safe_name(text: Any) -> str:
-    """Column-name form of a code, as in build_features.py.
+    """Column-name form of a code
 
     Examples:
         >>> safe_name("0.9% Sodium Chloride")
@@ -267,7 +227,7 @@ def safe_name(text: Any) -> str:
 
 
 def estimate_year(anchor_year: int, anchor_year_group: str, intime: datetime) -> int:
-    """Estimated real year of an ICU stay (sql/01_icustays_cohort.sql).
+    """Estimated real year of an ICU stay.
 
     First year of the anchor year group + 1 (its middle year) + the years
     between the anchor year and the (shifted) ICU admission.
@@ -292,48 +252,6 @@ def _derived_row(patient: Any, table: str, stay_id: str | None) -> dict[str, Any
             prefix = f"{table}/"
             return {k[len(prefix) :]: v for k, v in row.items() if k.startswith(prefix)}
     return {}
-
-
-def load_medication_class_map(
-    path: str,
-) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """Reads the drug-class lookup table (extracts/gsn_class_map.csv format).
-
-    Tab-separated, with columns gsn, medication and class_allpass (a list of
-    classes). Returns the classes by GSN code and by lower-case medication
-    name, as build_features.py did.
-
-    Examples:
-        >>> by_gsn, by_name = load_medication_class_map(  # doctest: +SKIP
-        ...     "extracts/gsn_class_map.csv")
-        >>> by_gsn["002689"]  # doctest: +SKIP
-        ['TN420', 'GA105']
-    """
-    table = pd.read_csv(path, sep="\t", na_values="['']", dtype={"gsn": str})
-    table["class_allpass"] = table["class_allpass"].apply(
-        lambda x: ast.literal_eval(x) if pd.notna(x) else x
-    )
-    table = table.dropna(subset=["class_allpass"])
-    by_gsn = (
-        table.dropna(subset=["gsn"])
-        .assign(gsn=lambda d: d["gsn"].str.strip())
-        .drop_duplicates(subset=["gsn"], keep="last")
-        .set_index("gsn")["class_allpass"]
-        .to_dict()
-    )
-    by_med = (
-        table.dropna(subset=["medication"])
-        .assign(
-            medication=lambda d: d["medication"].astype(str).str.strip().str.lower()
-        )
-        .drop_duplicates(subset=["medication"], keep="last")
-        .set_index("medication")["class_allpass"]
-        .to_dict()
-    )
-    return (
-        {k: list(v) for k, v in by_gsn.items()},
-        {k: list(v) for k, v in by_med.items()},
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +284,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
     Args:
         feature_spec: Output of :func:`select_features`; None for step 1.
         min_anchor_start: Keep anchor year groups starting in this year or
-            later; None keeps all. Default 2014.
+            later, e.g. 2014; None keeps all. Default None.
         max_year: Last estimated year kept; None keeps all. Default 2022
             (2020 = the paper's range).
         min_icu_hours: Minimum ICU stay length; 0 keeps all. Default 24.
@@ -377,8 +295,10 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             procedures are counted up to it. Default 24.
         use_diagnoses: Also collect current-admission diagnoses (``dx_``).
             They leak the outcome: drift analysis only. Default False.
-        medication_class_map: Path of the drug-class lookup table
-            (``extracts/gsn_class_map.csv`` format); None skips ``medclass_``.
+        use_medications: Also collect the medications given in the first
+            24 h (``med_`` by eMAR name, ``rx_`` by prescription drug name).
+            Default False. ``has_emar`` (any eMAR record, for the coverage by
+            year) is kept either way.
 
     Examples:
         >>> InICUMortalityEMDOTMIMIC4().input_schema
@@ -392,14 +312,14 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
     def __init__(
         self,
         feature_spec: dict[str, Any] | None = None,
-        min_anchor_start: int | None = 2014,
+        min_anchor_start: int | None = None,
         max_year: int | None = 2022,
         min_icu_hours: float = 24,
         require_clinical_data: bool = True,
         label: str = "died_icu_outtime_dod",
         prediction_hours: float = 24,
         use_diagnoses: bool = False,
-        medication_class_map: str | None = None,
+        use_medications: bool = False,
     ) -> None:
         super().__init__()
         if label not in LABELS:
@@ -412,13 +332,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
         self.label = label
         self.prediction_hours = prediction_hours
         self.use_diagnoses = use_diagnoses
-        self.medication_class_map = medication_class_map
-        self._classes_by_gsn: dict[str, list[str]] = {}
-        self._classes_by_med: dict[str, list[str]] = {}
-        if medication_class_map is not None:
-            self._classes_by_gsn, self._classes_by_med = load_medication_class_map(
-                medication_class_map
-            )
+        self.use_medications = use_medications
         if feature_spec is not None:
             self.input_schema = {
                 "numeric": (
@@ -429,7 +343,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             }
 
     def pre_filter(self, df: pl.LazyFrame) -> pl.LazyFrame:
-        """Keeps only the eMAR events that count as given (the largest table)."""
+        """Keeps only the eMAR events that count as given."""
         if "emar/event_txt" not in set(df.collect_schema().names()):
             return df
         event = (
@@ -439,7 +353,47 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
         return df.filter((pl.col("event_type") != "emar") | given)
 
     def build_record(self, patient: Any) -> dict[str, Any] | None:
-        """Cohort step, labels and every feature of the patient's first ICU stay."""
+        """Builds the record of a patient's first ICU stay.
+
+        Applies the cohort steps in order (hospital admission, ICU discharge
+        time, anchor year group, estimated year, stay length, first-day
+        clinical data). At the first step that fails, it writes that step's
+        name in ``excluded_at`` and returns the record without features.
+        Called once per patient by :meth:`__call__`, in both passes.
+
+        Args:
+            patient: A PyHealth :class:`~pyhealth.data.Patient` with the tables
+                of ``EMDOT_TABLES`` (and ``patients``, ``admissions``,
+                ``icustays``).
+
+        Returns:
+            None if the patient has no ICU stay or no ``patients`` row.
+            Otherwise a dict with:
+
+            * ``patient_id``, ``stay_id``, ``hadm_id``, ``est_year``,
+              ``anchor_year_group``: the first ICU stay and its year;
+            * ``died_icu_outtime_dod``, ``died_in_icu``,
+              ``died_in_icu_deathtime``: the three labels (0 or 1);
+            * ``excluded_at``: the cohort step that removed the patient, or
+              None if kept.
+
+            For a patient kept in the cohort, also:
+
+            * ``values``: numeric features (``vit_``, ``fdlab_``, ``sofa_``,
+              ``rrt_rrt``, ``age_at_icu``, ``adm_any_ed``), None when missing;
+            * ``categories``: text features (sex, service, care unit,
+              admission columns), None when missing;
+            * ``codes``: lists of codes by group (``px``, ``dxprior``, plus
+              ``med`` and ``rx`` with ``use_medications`` and ``dx`` with
+              ``use_diagnoses``);
+            * ``has_emar``: 1 if any medication was recorded as given.
+
+        Examples:
+            >>> task = InICUMortalityEMDOTMIMIC4()
+            >>> record = task.build_record(patient)  # doctest: +SKIP
+            >>> record["excluded_at"] is None  # doctest: +SKIP
+            True
+        """
         stays = [
             s
             for s in patient.get_events(event_type="icustays")
@@ -465,7 +419,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             "excluded_at": None,
         }
 
-        # Labels (three ways to die in the ICU, all kept)
+        # Labels
         admission = next(
             (
                 a
@@ -489,7 +443,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             deathtime is not None and has_out and intime <= deathtime <= outtime
         )
 
-        # 2-6. Cohort steps 
+        # Cohort steps
         steps = [
             (hadm_id is not None and admission is not None, STEP_HADM),
             (has_out, STEP_OUTTIME),
@@ -521,14 +475,14 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
                 record["excluded_at"] = step
                 return record
 
-        # First-day tables 
+        # First-day tables
         values: dict[str, float | None] = {}
         derived = {}
         for table, (prefix, columns) in DERIVED_TABLES.items():
             row = _derived_row(patient, table, stay_id)
             derived[table] = row
             values.update({f"{prefix}{c}": _float(row.get(c)) for c in columns})
-        # 7. Clinical data in the first 24 h (first-day vitals or labs)
+        # Clinical data in the first 24 h (first-day vitals or labs)
         clinical = [
             _float(derived[t].get(c))
             for t, columns in (
@@ -541,7 +495,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             record["excluded_at"] = STEP_CLINICAL
             return record
         rrt = _derived_row(patient, "first_day_rrt", stay_id)
-        # sql/11_first_day_rrt.sql: 1 if present or active, otherwise 0
+        # 1 if present or active, otherwise 0
         values["rrt_rrt"] = float(
             _float(rrt.get("dialysis_present")) == 1
             or _float(rrt.get("dialysis_active")) == 1
@@ -551,7 +505,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
         values["age_at_icu"] = _float(person.anchor_age) + (intime.year - anchor_year)
         edreg = _to_datetime(_attr(admission, "edregtime"))
         edout = _to_datetime(_attr(admission, "edouttime"))
-        # sql/09_admissions.sql: DATETIME_DIFF(edouttime, edregtime, HOUR) > 0,
+        # DATETIME_DIFF(edouttime, edregtime, HOUR) > 0,
         # which counts the hour boundaries crossed
         values["adm_any_ed"] = float(
             edreg is not None
@@ -582,12 +536,11 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             **{f"adm_{c}": _text(_attr(admission, c)) for c in admission_columns},
         }
 
-        # Codes (build_features.py "codes" tables)
+        # Codes
         end = intime + timedelta(hours=self.prediction_hours)
         emar_rows = self._given_medications(patient, hadm_id, intime, end)
         record["codes"] = self._codes(patient, hadm_id, intime, end, emar_rows)
         record["has_emar"] = int(bool(emar_rows))
-        record["medclass"] = self._medication_classes(emar_rows)
         return record
 
     def _codes(
@@ -605,7 +558,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             return f"{version}_{_text(_attr(event, 'icd_code'))}"
 
         codes: dict[str, list[str]] = {}
-        # sql/06: procedures of the admission done by the prediction day
+        # Procedures of the admission done by the prediction day
         codes["px"] = sorted(
             {
                 icd(p)
@@ -616,12 +569,13 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
                 and p.timestamp.date() <= end.date()
             }
         )
-        medications = (_text(_attr(e, "medication")) for e in emar_rows)
-        codes["med"] = sorted({m for m in medications if m})
-        drugs = (_text(_attr(e, "drug")) for e in emar_rows)
-        codes["rx"] = sorted({d for d in drugs if d})
+        if self.use_medications:  # given in the first 24 h
+            medications = (_text(_attr(e, "medication")) for e in emar_rows)
+            codes["med"] = sorted({m for m in medications if m})
+            drugs = (_text(_attr(e, "drug")) for e in emar_rows)
+            codes["rx"] = sorted({d for d in drugs if d})
         diagnoses = patient.get_events(event_type="diagnoses_icd")
-        # sql/04b: diagnoses of stays discharged before this ICU stay
+        # diagnoses of stays discharged before this ICU stay
         codes["dxprior"] = sorted(
             {
                 icd(d)
@@ -646,7 +600,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
     def _given_medications(
         patient: Any, hadm_id: str | None, intime: datetime, end: datetime
     ) -> list[Any]:
-        """eMAR events of the admission given in the first 24 h (sql/05_emar.sql)."""
+        """eMAR events of the admission given in the first 24 h."""
         rows = []
         for e in patient.get_events(event_type="emar", start=intime, end=end):
             event = (_text(_attr(e, "event_txt")) or "").lower()
@@ -657,20 +611,6 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
             ):
                 rows.append(e)
         return rows
-
-    def _medication_classes(self, emar_rows: list[Any]) -> list[str]:
-        """Drug classes of the given medications: by GSN code, then by name."""
-        classes: set[str] = set()
-        if not (self._classes_by_gsn or self._classes_by_med):
-            return []
-        for e in emar_rows:
-            gsn = (_text(_attr(e, "gsn")) or "").split()
-            found = self._classes_by_gsn.get(gsn[0]) if gsn else None
-            if found is None:
-                name = (_text(_attr(e, "medication")) or "").lower()
-                found = self._classes_by_med.get(name)
-            classes.update(str(c) for c in (found or []) if c is not None)
-        return sorted(classes)
 
     def __call__(self, patient: Any) -> list[dict[str, Any]]:
         record = self.build_record(patient)
@@ -701,7 +641,7 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
 
 
 # ---------------------------------------------------------------------------
-# Cohort-level steps (build_cohort.py summaries, build_features.py selection)
+# Cohort-level steps
 # ---------------------------------------------------------------------------
 def _flat_features(record: dict[str, Any]) -> dict[str, Any]:
     """Numeric values plus has_record / n_distinct of each code group."""
@@ -717,11 +657,28 @@ def cohort_summary(
     records: Iterable[dict[str, Any] | None], label: str = "died_icu_outtime_dod"
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Patients left after each cohort step, and stays and deaths by year.
+    Args:
+        records: The ``record`` of every sample returned by the task without a
+            ``feature_spec`` (step 1), one per patient with an ICU stay. Records
+            excluded from the cohort (``excluded_at`` set) are counted at their
+            step; ``None`` entries are skipped.
+        label: Label used for the ``death_rate`` column, one of
+            :data:`LABELS`. Default ``"died_icu_outtime_dod"``.
 
-    The two tables build_cohort.py saved (results/cohort_selection.csv and
-    results/cohort_by_year.csv). Counts only: safe to share.
+    Returns:
+        A tuple ``(selection, by_year)``:
+
+        * ``selection``: one row per cohort step, in order, with columns
+          ``step`` (the step's name) and ``patients`` (patients left after it).
+          The first row is every patient with an ICU stay.
+        * ``by_year``: one row per estimated year (``est_year``) of the final
+          cohort, with columns ``stays``, ``deaths_<label>`` for each of the
+          three labels, ``death_rate`` (for ``label``) and ``emar_coverage``
+          (share of stays with an eMAR record). Empty if no patient is left.
 
     Examples:
+        >>> task = InICUMortalityEMDOTMIMIC4()
+        >>> records = [s["record"] for s in dataset.set_task(task)]  # doctest: +SKIP
         >>> selection, by_year = cohort_summary(records)  # doctest: +SKIP
         >>> selection.to_csv("cohort_selection.csv", index=False)  # doctest: +SKIP
     """
@@ -771,7 +728,6 @@ def select_features(
 
     * Code groups: ``has_record``, ``n_distinct`` and the ``top_n`` codes
       found in the most stays (ties broken by code).
-    * Drug classes: every class found in the cohort.
     * Text features: every category found, plus ``"MISSING"``.
     * Numeric features missing for more than ``max_missing_rate`` of the
       cohort are removed; text features are exempt.
@@ -783,7 +739,7 @@ def select_features(
 
     Returns:
         The ``feature_spec`` for the task, and a feature dictionary (column,
-        source, role, missing_rate), like results/feature_dictionary.csv.
+        source, role, missing_rate)
 
     Examples:
         >>> spec, dictionary = select_features(records)  # doctest: +SKIP
@@ -795,12 +751,10 @@ def select_features(
     missing = pd.DataFrame([_flat_features(r) for r in kept]).isna().mean()
 
     code_counts: dict[str, Counter] = defaultdict(Counter)
-    class_counts: Counter = Counter()
     categories: dict[str, set] = {c: set() for c in CATEGORICAL}
     for r in kept:
         for group, codes in r["codes"].items():
             code_counts[group].update(set(codes))
-        class_counts.update(set(r.get("medclass", [])))
         for c in CATEGORICAL:
             categories[c].add(r["categories"].get(c) or MISSING)
     top_codes = {
@@ -838,9 +792,6 @@ def select_features(
         add(f"{prefix}n_distinct", source, 0.0, "numeric")
         for code in top_codes.get(group, []):
             add(f"{prefix}{safe_name(code)}", source, 0.0, "binary")
-    classes = sorted(class_counts)
-    for cls in classes:
-        add(f"medclass_{safe_name(cls)}", "medication_classes", 0.0, "binary")
     category_lists = {c: sorted(v) for c, v in categories.items()}
     for c, values in category_lists.items():
         rate = sum(1 for r in kept if not r["categories"].get(c)) / len(kept)
@@ -858,7 +809,6 @@ def select_features(
         "numeric": numeric,
         "binary": binary,
         "top_codes": top_codes,
-        "medclass": classes,
         "categories": category_lists,
     }
     return spec, pd.DataFrame(dictionary)
@@ -879,9 +829,6 @@ def vectorize(
         prefix, present = CODE_GROUPS[group], set(codes)
         for code in spec["top_codes"].get(group, []):
             flat[f"{prefix}{safe_name(code)}"] = int(code in present)
-    present_classes = set(record.get("medclass", []))
-    for cls in spec["medclass"]:
-        flat[f"medclass_{safe_name(cls)}"] = int(cls in present_classes)
     for c, values in spec["categories"].items():
         value = record["categories"].get(c) or MISSING
         for v in values:
