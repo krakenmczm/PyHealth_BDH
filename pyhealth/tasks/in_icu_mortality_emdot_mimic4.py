@@ -724,7 +724,7 @@ def select_features(
     top_n: int = 50,
     max_missing_rate: float | None = 0.10,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Chooses the feature columns on the whole cohort, as build_features.py did.
+    """Chooses the feature columns on the whole cohort
 
     * Code groups: ``has_record``, ``n_distinct`` and the ``top_n`` codes
       found in the most stays (ties broken by code).
