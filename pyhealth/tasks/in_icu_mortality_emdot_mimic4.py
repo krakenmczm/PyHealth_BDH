@@ -272,9 +272,9 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
     :func:`select_features` returns (step 2), the task returns one sample per
     patient in the cohort, with two model inputs:
 
-    * ``numeric``: continuous features. The processor z-scores them with the
-      training mean and standard deviation and sets missing values to the
-      training mean.
+    * ``numeric``: continuous features, raw: no scaling, and missing values
+      kept as NaN. Scale and fill them after splitting the data by year, with
+      statistics from each window's training patients only 
     * ``binary``: yes/no features (code columns, flags, and one column per
       category of each text feature, named ``"column=category"``).
 
@@ -334,13 +334,8 @@ class InICUMortalityEMDOTMIMIC4(BaseTask):
         self.use_diagnoses = use_diagnoses
         self.use_medications = use_medications
         if feature_spec is not None:
-            self.input_schema = {
-                "numeric": (
-                    "tensor",
-                    {"normalization": "zscore", "impute_strategy": "zero"},
-                ),
-                "binary": "tensor",
-            }
+            # Raw values: scaling and filling are fitted later, per window
+            self.input_schema = {"numeric": "tensor", "binary": "tensor"}
 
     def pre_filter(self, df: pl.LazyFrame) -> pl.LazyFrame:
         """Keeps only the eMAR events that count as given."""
