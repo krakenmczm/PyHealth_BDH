@@ -319,9 +319,28 @@ class TestCohortLevel(unittest.TestCase):
             ]
             samples += task(patient(*events, pid=f"p{i}"))
         self.assertEqual(len(samples[0]["numeric"]), len(spec["numeric"]))
-        dataset = create_sample_dataset(
+        # The task's inputs are raw: missing values stay NaN, nothing scaled
+        raw = create_sample_dataset(
             samples=samples,
             input_schema=task.input_schema,
+            output_schema=task.output_schema,
+            dataset_name="raw",
+        )
+        raw_batch = next(iter(get_dataloader(raw, batch_size=9, shuffle=False)))
+        self.assertTrue(torch.isnan(raw_batch["numeric"]).any())
+        hr = spec["numeric"].index("vit_heart_rate_min")
+        self.assertEqual(raw_batch["numeric"][0, hr].item(), 70)  # unscaled
+        # Scaled and filled after the split, as the training code does
+        scaled_schema = {
+            "numeric": (
+                "tensor",
+                {"normalization": "zscore", "impute_strategy": "zero"},
+            ),
+            "binary": "tensor",
+        }
+        dataset = create_sample_dataset(
+            samples=samples,
+            input_schema=scaled_schema,
             output_schema=task.output_schema,
             dataset_name="toy",
         )
