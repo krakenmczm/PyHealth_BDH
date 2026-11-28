@@ -1,4 +1,5 @@
 from typing import Any, List, Dict
+import random
 from pyhealth.datasets import MIMIC4EHRDataset, SampleDataset, split_by_patient, create_sample_dataset
 from pyhealth.datasets.utils import get_dataloader
 from pyhealth.models import LogisticRegression
@@ -14,11 +15,6 @@ from pyhealth.tasks.in_icu_mortality_emdot_mimic4 import (
 
 # Folder that holds hosp/, icu/ and derived/ (change to yours)
 ROOT = "/Users/karen/mimic-iv-3.1"
-
-# For train/valid/test splits
-train_frac = 0.5
-valid_frac = 0.25
-inperiod_test_frac = 0.25
 
 def flatten_records(sample_ds: SampleDataset) -> List[Dict[str, Any]]:
     '''Further process resulting SampleDataset from set_task: 
@@ -84,6 +80,9 @@ def split_sd_aftertask(allperiod: List[Dict[str, Any]],
         inperiod_test_proc: SampleDataset, in-period test set. Training set feature processor applied.
         outperiod_test_proc: List of SampleDatasets, one per out-of-period year. Empty if all-period evaluation (threshold_yr = None), or if threshold_yr is the most recent year represented in the dataset. Training set feature processor applied.
     '''
+    yr_list = sorted(list(set([rec['est_year'] for rec in allperiod])))
+    min_year_extent = min(yr_list)
+    max_year_extent = max(yr_list)
 
     ### Input checking ###
     if threshold_yr is None:
@@ -139,11 +138,16 @@ def split_sd_aftertask(allperiod: List[Dict[str, Any]],
     inperiod_train, inperiod_valid, inperiod_test = split_by_patient(dataset = inperiod_presplit, ratios = (train_frac, valid_frac, inperiod_test_frac), seed = seed)
 
     # For in-period training set only: generate copy of training set but this time with actual type-specific processors (e.g. TensorProcessor with normalization & impute_strategy, etc.)
+    INPUT_SCHEMA = {
+        "numeric": ("tensor", {"normalization": "zscore", "impute_strategy": "zero"}),
+        "binary": "tensor"
+        }
+    OUTPUT_SCHEMA = {"mortality": "binary"}
+
     inperiod_train_proc = create_sample_dataset(
         samples = inperiod_train,
-        input_schema = {"numeric": ('tensor', {'normalization': "zscore", "impute_strategy": "zero"}), 
-                        "binary": 'tensor'},
-        output_schema = {'mortality': 'binary'},
+        input_schema = INPUT_SCHEMA,
+        output_schema = OUTPUT_SCHEMA,
         in_memory = False
     )
 
@@ -154,17 +158,22 @@ def split_sd_aftertask(allperiod: List[Dict[str, Any]],
     # For valid, inperiod test (& outperiod test, eventually): apply fitted train processors
     inperiod_valid_proc = create_sample_dataset(
         samples = inperiod_valid,
-        input_schema = train_input_processors,
-        output_schema = train_output_processors
+        input_schema = INPUT_SCHEMA,
+        output_schema = OUTPUT_SCHEMA,
+        input_processors = train_input_processors,
+        output_processors = train_output_processors
     )
 
     inperiod_test_proc = create_sample_dataset(
         samples = inperiod_test,
-        input_schema = train_input_processors,
-        output_schema = train_output_processors
+        input_schema = INPUT_SCHEMA,
+        output_schema = OUTPUT_SCHEMA,
+        input_processors = train_input_processors,
+        output_processors = train_output_processors
     )
 
     ### Out-of-period dataset ###
+    
     # All-period
     if ((threshold_yr is None) and (window is None)) or (threshold_yr == max_year_extent):
         outperiod_test_proc = {}
@@ -181,8 +190,10 @@ def split_sd_aftertask(allperiod: List[Dict[str, Any]],
         for yr in sorted(outperiod_test_sets.keys()):
             yr_set = create_sample_dataset(
                 samples = outperiod_test_sets[yr],
-                input_schema = train_input_processors,
-                output_schema = train_output_processors
+                input_schema = INPUT_SCHEMA,
+                output_schema = INPUT_SCHEMA,
+                input_processors = train_input_processors,
+                output_processors = train_output_processors
             )
             outperiod_test_proc[yr] = yr_set
 
@@ -196,54 +207,155 @@ def emdot_lr_modeling(inperiod_train: SampleDataset,
                       patience: int = 10) -> dict[str, Any]:
 
     num_features = len(inperiod_train[0]['numeric']) + len(inperiod_train[0]['binary'])
-    aurocs = {'inperiod': [], 'outperiod': {}}
+    aurocs = {'inperiod': {}, 'outperiod': {}}
     inperiod_train_dl = get_dataloader(inperiod_train, batch_size = len(dataset.unique_patient_ids))
     inperiod_valid_dl = get_dataloader(inperiod_valid, batch_size = len(dataset.unique_patient_ids))
-    inperiod_test_dl = get_dataloader(inperiod_test, batch_size = len(dataset.unique_patient_ids))
 
     # All-period would not have any out-of-period test sets
     if not outperiod_test_proc:
-        phlr_model = LogisticRegression(dataset = inperiod_train, embedding_dim = num_features)
+        allperiod_phlr_model = LogisticRegression(dataset = inperiod_train, embedding_dim = num_features)
 
-        ph_trainer = Trainer(model = phlr_model, device = 'cpu', metrics = ['roc_auc'])
+        allperiod_ph_trainer = Trainer(model = allperiod_phlr_model, 
+                                       device = 'cpu', 
+                                       metrics = ['roc_auc'])
 
-        ph_trainer.train(train_dataloader = inperiod_train_dl, 
-                    val_dataloader = inperiod_valid_dl,
-                    test_dataloader = inperiod_test_dl,
-                    epochs = num_epochs,
-                    patience = patience,
-                    load_best_model_at_last = True)
-
+        allperiod_ph_trainer.train(train_dataloader = inperiod_train_dl, 
+                                val_dataloader = inperiod_valid_dl,
+                                epochs = num_epochs,
+                                patience = patience,
+                                load_best_model_at_last = True)
+        
         # Partition "in-period" test set by year, then report by-year test set AUROC for plotting
+        test_set_yrs = sorted(list(set([rec['est_year'] for rec in inperiod_test])))
+        test_set_partitioned = {yr: [] for yr in test_set_yrs}
+
+        for pt in inperiod_test:
+            test_set_partitioned[pt['est_year']].append(pt)
+
+        for yr in test_set_partitioned.keys():
+            inperiod_test_dl = get_dataloader(test_set_partitioned[yr], batch_size = len(dataset.unique_patient_ids))
+            yr_scores = allperiod_ph_trainer.evaluate(dataloader = inperiod_test_dl)
+            aurocs['inperiod'][yr] = yr_scores['roc_auc']
         
     else:
+        inperiod_test_dl = get_dataloader(inperiod_test, batch_size = len(dataset.unique_patient_ids))
+
         phlr_model = LogisticRegression(dataset = inperiod_train, embedding_dim = num_features)
 
-        ph_trainer = Trainer(model = phlr_model, device = 'cpu', metrics = ['roc_auc'])
+        ph_trainer = Trainer(model = phlr_model, 
+                             device = 'cpu', 
+                             metrics = ['roc_auc'])
 
         ph_trainer.train(train_dataloader = inperiod_train_dl, 
                     val_dataloader = inperiod_valid_dl,
-                    test_dataloader = inperiod_test_dl,
                     epochs = num_epochs,
                     patience = patience,
                     load_best_model_at_last = True)
 
         # In-period test performance
-        ph_trainer.evaluate(dataloader = inperiod_test_dl)
+        inperiod_scores = ph_trainer.evaluate(dataloader = inperiod_test_dl)
+        aurocs['inperiod']['test_auroc'] = inperiod_scores['roc_auc']
 
         # Out-of-period test performance
         for yr, testset in outperiod_test_proc.items():
-            pass
+            outperiod_test_dl = get_dataloader(testset, batch_size = len(dataset.unique_patient_ids))
+            outperiod_scores = ph_trainer.evaluate(dataloader = outperiod_test_dl)
+            aurocs['outperiod'][yr] = outperiod_scores['roc_auc']
 
-    #return aurocs
-    return inperiod_test_dl
+    return aurocs
+
+def compute_results_by_yr(flat_records: List[Dict[str, Any]],
+                          window: int | None,
+                          historical_subsampling: bool,
+                          seed: int) -> dict[int, Any]:
+    results_by_yr = {}
+    yr_list = sorted(list(set([rec['est_year'] for rec in flat_records])))
+
+    for yr in yr_list:
+        train, valid, test, outperiod_test = split_sd_aftertask(
+            allperiod = flat_records, 
+            threshold_yr = yr, 
+            window = window, 
+            historical_subsampling = historical_subsampling, 
+            train_frac = train_frac, 
+            valid_frac = valid_frac, 
+            inperiod_test_frac = inperiod_test_frac, 
+            seed = seed)
+        yr_aurocs = emdot_lr_modeling(
+            inperiod_train = train,
+            inperiod_valid = valid,
+            inperiod_test = test,
+            outperiod_test_proc = outperiod_test,
+            num_epochs = epochs,
+            patience = patience
+        )
+        results_by_yr[yr] = yr_aurocs
+
+    return results_by_yr
+
+def get_emdot_results(sd_posttask: SampleDataset,
+                      seed: int):
+
+    flattened_records = flatten_records(sd_posttask)
+
+    # All-period - no need to call compute_results_by_yr; the emdot_lr_modeling function will output the AUROCs for all-period if input arguments correct
+    allperiod_train, allperiod_valid, allperiod_test, outperiod_test = split_sd_aftertask(
+        allperiod = flattened_records, 
+        threshold_yr = None, 
+        window = None, 
+        historical_subsampling = False, 
+        train_frac = train_frac, 
+        valid_frac = valid_frac, 
+        inperiod_test_frac = inperiod_test_frac, 
+        seed = run_seed
+    )
+    allperiod_res = emdot_lr_modeling(
+        inperiod_train = allperiod_train,
+        inperiod_valid = allperiod_valid,
+        inperiod_test = allperiod_test,
+        outperiod_test_proc = outperiod_test, # should be {}
+        num_epochs = epochs,
+        patience = patience
+    )
+
+    # All-historical
+    allhist_res = compute_results_by_yr(
+        flat_records = flattened_records,
+        window = None,
+        historical_subsampling = False,
+        seed = seed
+    )
+
+    # All-historical, subsampling
+    allhistsub_res = compute_results_by_yr(
+        flat_records = flattened_records,
+        window = window_size,
+        historical_subsampling = True,
+        seed = seed
+    )
+
+    # Sliding window
+    sw_res = compute_results_by_yr(
+        flat_records = flattened_records,
+        window = window_size,
+        historical_subsampling = False,
+        seed = seed
+    )
+
+    return allperiod_res, allhist_res, allhistsub_res, sw_res
 
 if __name__ == "__main__":
+    
+    # For train/valid/test splits
     train_frac = 0.5
     valid_frac = 0.25
-    inperiod_test_frac = 0.25 # TEST: train/valid/inperiod_test don't add up to 1
-    min_year_extent = min([rec['record']['est_year'] for rec in ds_sd])
-    max_year_extent = max([rec['record']['est_year'] for rec in ds_sd])
+    inperiod_test_frac = 0.25
+
+    # Dataset splitting and modeling config
+    window_size = 4
+    run_seed = 6250
+    epochs = 50
+    patience = 10
 
     dataset = MIMIC4EHRDataset(
         root=ROOT,
@@ -262,5 +374,8 @@ if __name__ == "__main__":
     print(selection)
     print(by_year)
 
-    # Obtain flattened records
-    flattened_records = flatten_records(ds_sd)
+    # Run the EMDOT pipeline
+    allperiod_res, allhist_res, allhistsub_res, sw_res = get_emdot_results(
+        sd_posttask = ds_sd, 
+        seed = run_seed
+    )
