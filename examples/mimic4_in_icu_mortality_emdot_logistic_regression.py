@@ -53,7 +53,198 @@ def flatten_records(sample_ds: SampleDataset) -> List[Dict[str, Any]]:
 
     return flat_records
 
+def split_sd_aftertask(allperiod: List[Dict[str, Any]],
+                       threshold_yr: int | None,
+                       window: int | None,
+                       historical_subsampling: bool | None,
+                       train_frac: float,
+                       valid_frac: float,
+                       inperiod_test_frac: float,
+                       seed: int) -> tuple[SampleDataset | dict]:
+    '''Splits in-period records into training, validation, and test sets. Also splits out-of-period records into separate test sets by year.
+        For numeric features, applies z-score normalization and zero-imputation for missing values on the *training* set, then extracts the fitted processors to apply to the validation, in-period test, and out-of-period test sets.
+
+    Args:
+        allperiod: Flattened records for patients in all years. 
+        threshold_yr: Cutoff year, before which patient data is included for model training. Includes the cutoff year itself. If None, this becomes all-period model training, which Zhou et al. use as a baseline benchmark. They remark that this time-agnostic 
+        window: Width of sliding window, if evaluating model drift using sliding window approach. 
+            All-historical evaluation: window = None, historical_subsampling = False, and threshold_yr != None
+            All-historical subsampled evaluation: window != None, historical_subsampling = True, and threshold_yr != None
+            All-period evaluation: window = None, threshold_yr = None
+        historical_subsampling: If all-historical evaluation, should the in-period set be subsampled to match the same size of sliding window.
+            If historical_subsampling = True: window should not be None.
+        train_frac: Proportion of in-period set to be used for model training.
+        valid_frac: Proportion of in-period set to be used for model validation.
+        inperiod_test_frac: Proportion of in-period set to be used for model test.
+        seed: Random seed for splitting in-period set.
+    
+    Returns:
+        inperiod_train_proc: SampleDataset, training set. Numeric features z-score normalized, and missing values zero-imputed. 
+        inperiod_valid_proc: SampleDataset, validation set. Training set feature processor applied. 
+        inperiod_test_proc: SampleDataset, in-period test set. Training set feature processor applied.
+        outperiod_test_proc: List of SampleDatasets, one per out-of-period year. Empty if all-period evaluation (threshold_yr = None), or if threshold_yr is the most recent year represented in the dataset. Training set feature processor applied.
+    '''
+
+    ### Input checking ###
+    if threshold_yr is None:
+        # All-period
+        if window is None:
+            print('Inferring all-period evaluation.')
+            inperiod = allperiod
+        else:
+            raise ValueError('Sliding window width provided without threshold year.')
+    else:
+        # All-historical
+        if window is None:
+            if historical_subsampling is False:
+                print('Inferring all-historical evaluation of model drift.')
+                inperiod = [rec for rec in allperiod if rec['est_year'] <= threshold_yr]
+            else: # historical_subsampling == True
+                raise ValueError('Missing window width to be able to perform subsampling.')
+        else: # window != None
+            if (threshold_yr > max_year_extent) or (threshold_yr < min_year_extent):
+                raise ValueError('Threshold year out of timespan covered by dataset.')
+            if threshold_yr == max_year_extent:
+                print('Threshold year is the latest year covered by dataset - this is equivalent to all-period evaluation.')
+            if window <= 0:
+                raise ValueError('Sliding window width must be a positive integer.')
+            inperiod_sw = [rec for rec in allperiod if (rec['est_year'] <= threshold_yr) and (rec['est_year'] >= threshold_yr - window + 1)]
+            if historical_subsampling is False:
+                # Sliding window. If dataset small, classes imbalanced, and/or window small, this or the later splitting step may throw a ValueError reflecting detection of 1 class label though 2 class labels expected.    
+                print('Inferring sliding window evaluation of model drift.')
+                inperiod = inperiod_sw         
+            # All-historical subsampling          
+            else: 
+                print('Inferring all-historical subsampled evaluation of model drift. Subsampling will create an in-period dataset of the same size as a sliding window of width ' + str(window) + ' preceding threshold year ' + str(threshold_yr) + '.')
+                inperiod = random.sample([rec for rec in allperiod if rec['est_year'] <= threshold_yr], 
+                                         k = len(inperiod_sw))
+                # print(set([rec['est_year'] for rec in inperiod]))
+                # print(set([rec['est_year'] for rec in inperiod_sw]))
+
+    if (train_frac + valid_frac + inperiod_test_frac) != 1:
+        raise ValueError('Sum of in-period training, validation, and test set proportions != 1.')
+
+    ### In-period dataset ###
+
+    # Convert inperiod to SampleDataset using create_sample_dataset, in preparation for splitting into train/validation/test sets. Pass RawProcessors to avoid early normalization before splitting.
+    inperiod_presplit = create_sample_dataset(
+        samples = inperiod,
+        input_schema = {"numeric": 'raw', 
+                        "binary": 'raw'},
+        output_schema = {'mortality': 'raw'},
+        in_memory = False
+    )
+
+    # Use split_by_patient to split inperiod into train/valid/test sets
+    inperiod_train, inperiod_valid, inperiod_test = split_by_patient(dataset = inperiod_presplit, ratios = (train_frac, valid_frac, inperiod_test_frac), seed = seed)
+
+    # For in-period training set only: generate copy of training set but this time with actual type-specific processors (e.g. TensorProcessor with normalization & impute_strategy, etc.)
+    inperiod_train_proc = create_sample_dataset(
+        samples = inperiod_train,
+        input_schema = {"numeric": ('tensor', {'normalization': "zscore", "impute_strategy": "zero"}), 
+                        "binary": 'tensor'},
+        output_schema = {'mortality': 'binary'},
+        in_memory = False
+    )
+
+    # Fitted train processors
+    train_input_processors = inperiod_train_proc.input_processors
+    train_output_processors = inperiod_train_proc.output_processors
+
+    # For valid, inperiod test (& outperiod test, eventually): apply fitted train processors
+    inperiod_valid_proc = create_sample_dataset(
+        samples = inperiod_valid,
+        input_schema = train_input_processors,
+        output_schema = train_output_processors
+    )
+
+    inperiod_test_proc = create_sample_dataset(
+        samples = inperiod_test,
+        input_schema = train_input_processors,
+        output_schema = train_output_processors
+    )
+
+    ### Out-of-period dataset ###
+    # All-period
+    if ((threshold_yr is None) and (window is None)) or (threshold_yr == max_year_extent):
+        outperiod_test_proc = {}
+    # All-historical +/- subsampling, sliding window
+    else: 
+        outperiod = [rec for rec in allperiod if rec['est_year'] > threshold_yr]
+        out_yrs = sorted(list(set([rec['est_year'] for rec in outperiod])))
+        outperiod_test_sets = {yr: [] for yr in out_yrs}
+        outperiod_test_proc = {}
+
+        for pt in outperiod:
+            outperiod_test_sets[pt['est_year']].append(pt)
+
+        for yr in sorted(outperiod_test_sets.keys()):
+            yr_set = create_sample_dataset(
+                samples = outperiod_test_sets[yr],
+                input_schema = train_input_processors,
+                output_schema = train_output_processors
+            )
+            outperiod_test_proc[yr] = yr_set
+
+    return inperiod_train_proc, inperiod_valid_proc, inperiod_test_proc, outperiod_test_proc
+
+def emdot_lr_modeling(inperiod_train: SampleDataset, 
+                      inperiod_valid: SampleDataset, 
+                      inperiod_test: SampleDataset, 
+                      outperiod_test_proc: dict[int, SampleDataset] | None,
+                      num_epochs: int = 50,
+                      patience: int = 10) -> dict[str, Any]:
+
+    num_features = len(inperiod_train[0]['numeric']) + len(inperiod_train[0]['binary'])
+    aurocs = {'inperiod': [], 'outperiod': {}}
+    inperiod_train_dl = get_dataloader(inperiod_train, batch_size = len(dataset.unique_patient_ids))
+    inperiod_valid_dl = get_dataloader(inperiod_valid, batch_size = len(dataset.unique_patient_ids))
+    inperiod_test_dl = get_dataloader(inperiod_test, batch_size = len(dataset.unique_patient_ids))
+
+    # All-period would not have any out-of-period test sets
+    if not outperiod_test_proc:
+        phlr_model = LogisticRegression(dataset = inperiod_train, embedding_dim = num_features)
+
+        ph_trainer = Trainer(model = phlr_model, device = 'cpu', metrics = ['roc_auc'])
+
+        ph_trainer.train(train_dataloader = inperiod_train_dl, 
+                    val_dataloader = inperiod_valid_dl,
+                    test_dataloader = inperiod_test_dl,
+                    epochs = num_epochs,
+                    patience = patience,
+                    load_best_model_at_last = True)
+
+        # Partition "in-period" test set by year, then report by-year test set AUROC for plotting
+        
+    else:
+        phlr_model = LogisticRegression(dataset = inperiod_train, embedding_dim = num_features)
+
+        ph_trainer = Trainer(model = phlr_model, device = 'cpu', metrics = ['roc_auc'])
+
+        ph_trainer.train(train_dataloader = inperiod_train_dl, 
+                    val_dataloader = inperiod_valid_dl,
+                    test_dataloader = inperiod_test_dl,
+                    epochs = num_epochs,
+                    patience = patience,
+                    load_best_model_at_last = True)
+
+        # In-period test performance
+        ph_trainer.evaluate(dataloader = inperiod_test_dl)
+
+        # Out-of-period test performance
+        for yr, testset in outperiod_test_proc.items():
+            pass
+
+    #return aurocs
+    return inperiod_test_dl
+
 if __name__ == "__main__":
+    train_frac = 0.5
+    valid_frac = 0.25
+    inperiod_test_frac = 0.25 # TEST: train/valid/inperiod_test don't add up to 1
+    min_year_extent = min([rec['record']['est_year'] for rec in ds_sd])
+    max_year_extent = max([rec['record']['est_year'] for rec in ds_sd])
+
     dataset = MIMIC4EHRDataset(
         root=ROOT,
         tables=EMDOT_TABLES,
@@ -73,66 +264,3 @@ if __name__ == "__main__":
 
     # Obtain flattened records
     flattened_records = flatten_records(ds_sd)
-
-    # Create sample dataset from flattened records using create_sample_dataset, in preparation for splitting into train/validation/test sets. Pass RawProcessors to avoid early normalization before splitting
-    all_pts_sd_presplit = create_sample_dataset(
-        samples = flattened_records,
-        input_schema = {"numeric": 'raw', 
-                        "binary": 'raw'},
-        output_schema = {'mortality': 'raw'},
-        in_memory = False
-    )
-
-    # Use split_by_patient to split into train/valid/test sets
-    allperiod_train, allperiod_valid, allperiod_test = split_by_patient(dataset = all_pts_sd_presplit, ratios = (train_frac, valid_frac, inperiod_test_frac), seed = 6250)
-
-    # For train set only: generate copy of train set but this time with actual type-specific processors (e.g. TensorProcessor with normalization & impute_strategy, etc.)
-    allperiod_train_processed = create_sample_dataset(
-        samples = allperiod_train,
-        input_schema = {"numeric": ('tensor', {'normalization': "zscore", "impute_strategy": "zero"}), 
-                        "binary": 'tensor'},
-        output_schema = {'mortality': 'binary'},
-        in_memory = False
-    )
-
-    # Fitted training set processors
-    allperiod_train_input_processors = allperiod_train_processed.input_processors
-    allperiod_train_output_processors = allperiod_train_processed.output_processors
-
-    # For valid, in-period test (& out-of-period test, eventually): apply fitted training set processors
-    allperiod_valid_processed = create_sample_dataset(
-        samples = allperiod_valid,
-        input_schema = allperiod_train_input_processors,
-        output_schema = allperiod_train_output_processors
-    )
-
-    allperiod_test_processed = create_sample_dataset(
-        samples = allperiod_test,
-        input_schema = allperiod_train_input_processors,
-        output_schema = allperiod_train_output_processors
-    )
-
-    # Create dataloaders for train/valid/test sets
-    allperiod_train_dl = get_dataloader(allperiod_train_processed, batch_size = len(dataset.unique_patient_ids))
-    allperiod_valid_dl = get_dataloader(allperiod_valid_processed, batch_size = len(dataset.unique_patient_ids))
-    allperiod_test_dl = get_dataloader(allperiod_test_processed, batch_size = len(dataset.unique_patient_ids))
-
-    # Get number of features
-    num_feats = len(allperiod_train_processed[0]['numeric']) + len(allperiod_train_processed[0]['binary'])
-
-    # Create model object
-    phlr_model = LogisticRegression(dataset = allperiod_train_processed, embedding_dim = num_feats)
-
-    # Create Trainer object
-    ph_trainer = Trainer(model = phlr_model, device = 'cpu', metrics = ['roc_auc'])
-
-    # Create training environment
-    ph_trainer.train(train_dataloader = allperiod_train_dl, 
-                 val_dataloader = allperiod_valid_dl,
-                 test_dataloader = allperiod_test_dl,
-                 epochs = 50,
-                 patience = 10,
-                 load_best_model_at_last = True)
-
-    # Report test set metric(s)
-    ph_trainer.evaluate(dataloader = allperiod_test_dl)
